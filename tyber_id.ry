@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+TYBER ID – захват доменов ВК + Telegram-уведомления (версия для Render)
+Все настройки берутся из переменных окружения.
+"""
+
+import requests
+import time
+import os
+import sys
+import logging
+import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ========== Цветной вывод (для логов) ==========
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    RESET = '\033[0m'
+
+def print_info(msg): print(f"{Colors.BLUE}{msg}{Colors.RESET}")
+def print_success(msg): print(f"{Colors.GREEN}{msg}{Colors.RESET}")
+def print_warning(msg): print(f"{Colors.YELLOW}{msg}{Colors.RESET}")
+def print_error(msg): print(f"{Colors.RED}{msg}{Colors.RESET}")
+
+# ========== Константы ==========
+VK_VERSION = "5.199"
+TOKEN_FILE = "vk_token.txt"
+TG_TOKEN_FILE = "tg_token.txt"
+TG_CHATID_FILE = "tg_chatid.txt"
+
+BASE_INTERVAL = 0.002        # 2 мс между циклами
+MAX_RETRIES = 0
+CAPTCHA_WAIT = 15
+MAX_CAPTURE_FAILS = 3
+
+# ========== Вспомогательные функции ==========
+def clean_domain(raw):
+    raw = raw.strip().lower()
+    raw = raw.replace('@', '').replace('https://vk.com/', '').replace('vk.com/', '')
+    return raw
+
+def is_valid_domain(domain):
+    if not domain or len(domain) < 3 or len(domain) > 32:
+        return False
+    return bool(re.match(r'^[a-z0-9_]+$', domain))
+
+def format_owner(owner_data):
+    if not owner_data:
+        return None
+    obj_type = owner_data.get('type')
+    obj_id = owner_data.get('id')
+    if obj_type == 'group':
+        return f"club{obj_id}"
+    elif obj_type == 'user':
+        return f"id{obj_id}"
+    elif obj_type == 'application':
+        return f"app{obj_id}"
+    return None
+
+# ========== Telegram функции (синхронные) ==========
+def send_telegram(tg_token, chat_id, domain, success=True, old_owner=None, elapsed=0.0, target_desc="профиль"):
+    if not tg_token or not chat_id:
+        return False
+    if success:
+        if old_owner:
+            swap_info = f"Перенесён с: {old_owner} → {target_desc}"
+        else:
+            swap_info = f"Установлен на: {target_desc} (ранее был свободен)"
+        text = (f"Домен Спизжен😎!\n\n"
+                f"Домен: {domain}\n"
+                f"{swap_info}\n"
+                f"Статус: ✅ Струблен\n"
+                f"Время захвата: {elapsed:.3f} сек.\n"
+                f"Время события: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"🔥 TYBER ID работает🤭")
+    else:
+        text = (f"⚠️ Ошибка захвата\n\n"
+                f"Домен: {domain}\n"
+                f"Статус: ❌ Не удалось\n"
+                f"Причина: {old_owner if isinstance(old_owner, str) else 'неизвестно'}\n"
+                f"Время: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                          data={'chat_id': chat_id, 'text': text}, timeout=3)
+        r.raise_for_status()
+        result = r.json()
+        if result.get('ok'):
+            print_success("📨 Уведомление отправлено в Telegram")
+            return True
+        else:
+            print_error(f"❌ Telegram API вернул ошибку: {result}")
+            return False
+    except Exception as e:
+        print_error(f"❌ Ошибка отправки в Telegram: {e}")
+        return False
+
+# ========== VK монитор ==========
+class VKMonitor:
+    def __init__(self, token):
+        self.token = token
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=0,
+            status_forcelist=[],
+            backoff_factor=0,
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Connection': 'keep-alive'
+        })
+
+    def _api_request(self, method, url, params=None, data=None, timeout=0.3):
+        params = params or {}
+        params.update({'access_token': self.token, 'v': VK_VERSION})
+        try:
+            if method.upper() == 'GET':
+                resp = self.session.get(url, params=params, timeout=timeout)
+            else:
+                resp = self.session.post(url, params=params, data=data, timeout=timeout)
+            resp.raise_for_status()
+            json_data = resp.json()
+            if 'error' in json_data:
+                code = json_data['error'].get('error_code')
+                if code == 6:
+                    time.sleep(0.001)
+                    return None
+                elif code == 14:
+                    return 'captcha'
+                else:
+                    return {'error_code': code, 'error_msg': json_data['error'].get('error_msg', '')}
+            return json_data.get('response')
+        except Exception:
+            return {'error': 'request_failed'}
+
+    def get_owner_info(self, domain):
+        resp = self._api_request('GET', 'https://api.vk.com/method/utils.resolveScreenName',
+                                 params={'screen_name': domain}, timeout=0.3)
+        if resp is None:
+            return None
+        if resp == 'captcha':
+            return 'captcha'
+        if isinstance(resp, dict) and 'error_code' in resp:
+            print_error(f"Ошибка API при проверке {domain}: код {resp['error_code']} - {resp['error_msg']}")
+            return None
+        if isinstance(resp, dict) and 'error' in resp:
+            return None
+        if isinstance(resp, dict) and 'type' in resp:
+            owner_type = resp['type']
+            owner_id = None
+            if owner_type == 'group':
+                owner_id = resp.get('group_id')
+            elif owner_type == 'user':
+                owner_id = resp.get('user_id')
+            elif owner_type == 'application':
+                owner_id = resp.get('app_id')
+            return {'type': owner_type, 'id': owner_id}
+        return True
+
+    def capture_domain(self, domain, target_type='profile', group_id=None):
+        if target_type == 'profile':
+            resp = self._api_request('POST', 'https://api.vk.com/method/account.saveProfileInfo',
+                                     params={'screen_name': domain}, timeout=0.3)
+        else:
+            if not group_id:
+                return False, "Нет ID группы"
+            try:
+                group_id = int(group_id)
+            except:
+                return False, f"Некорректный ID группы: {group_id}"
+            resp = self._api_request('POST', 'https://api.vk.com/method/groups.edit',
+                                     params={'group_id': group_id, 'screen_name': domain}, timeout=0.3)
+        if resp is None:
+            return False, "Нет ответа от API"
+        if resp == 'captcha':
+            return False, "Капча"
+        if isinstance(resp, dict):
+            if 'error_code' in resp:
+                return False, f"Ошибка API {resp['error_code']}: {resp['error_msg']}"
+            if 'error' in resp:
+                return False, f"Сетевая ошибка: {resp['error']}"
+        if resp == 1 or (isinstance(resp, dict) and resp.get('response') == 1):
+            return True, "Захвачен"
+        return False, f"Неизвестный ответ: {resp}"
+
+    def load_groups(self):
+        params = {
+            'access_token': self.token,
+            'v': VK_VERSION,
+            'extended': 1,
+            'filter': 'admin'
+        }
+        try:
+            resp = self.session.get("https://api.vk.com/method/groups.get", params=params, timeout=1)
+            resp.raise_for_status()
+            data = resp.json()
+            if 'error' in data:
+                return []
+            response = data.get('response')
+            if isinstance(response, dict):
+                return response.get('items', [])
+            elif isinstance(response, list):
+                return [{'id': gid, 'name': f'Группа {gid}'} for gid in response]
+            return []
+        except:
+            return []
+
+# ========== Чтение переменных окружения ==========
+def get_env_var(name, required=True):
+    value = os.environ.get(name)
+    if required and not value:
+        print_error(f"❌ Ошибка: переменная окружения {name} не задана.")
+        sys.exit(1)
+    return value
+
+def main():
+    print_info("🚀 Запуск TYBER ID (Render-версия)")
+
+    # Читаем переменные окружения
+    vk_token = get_env_var('VK_TOKEN')
+    tg_token = get_env_var('TG_TOKEN', required=False)
+    tg_chatid = get_env_var('TG_CHATID', required=False)
+    target_type = get_env_var('TARGET_TYPE', required=False) or 'profile'  # 'profile' или 'group'
+    group_id = get_env_var('GROUP_ID', required=False)
+    domains_str = get_env_var('DOMAINS', required=True)  # список через запятую
+
+    # Парсим домены
+    domains = [d.strip() for d in domains_str.split(',') if d.strip()]
+    valid_domains = []
+    for d in domains:
+        cleaned = clean_domain(d)
+        if is_valid_domain(cleaned):
+            valid_domains.append(cleaned)
+        else:
+            print_warning(f"Домен '{d}' недопустим, пропущен.")
+
+    if not valid_domains:
+        print_error("❌ Нет допустимых доменов для мониторинга.")
+        sys.exit(1)
+
+    # Цель
+    target_desc = "профиль" if target_type == 'profile' else f"группа {group_id}"
+
+    monitor = VKMonitor(vk_token)
+
+    # Если цель — группа, проверим её существование
+    if target_type == 'group':
+        groups = monitor.load_groups()
+        group_ids = [g['id'] for g in groups]
+        try:
+            gid = int(group_id)
+            if gid not in group_ids:
+                print_warning(f"⚠️ Группа {gid} не найдена в списке ваших групп. Возможно, у вас нет прав администратора.")
+        except:
+            pass
+
+    print_success(f"\n✅ Начинаю мониторинг {len(valid_domains)} доменов...")
+    print_info(f"Цель: {target_desc}")
+    print_info(f"Интервал проверки: {BASE_INTERVAL*1000:.1f} мс")
+
+    last_owner = {domain: None for domain in valid_domains}
+    capture_fails = {domain: 0 for domain in valid_domains}
+
+    try:
+        while True:
+            for domain in valid_domains:
+                status = monitor.get_owner_info(domain)
+                if status is None:
+                    continue
+                if status == 'captcha':
+                    print_error(f"❗ Капча при проверке {domain}, жду {CAPTCHA_WAIT} сек...")
+                    time.sleep(CAPTCHA_WAIT)
+                    continue
+
+                if status is True:
+                    old_owner_str = format_owner(last_owner[domain]) if last_owner[domain] else None
+                    print_success(f"🔥 {domain} СВОБОДЕН! (ранее: {old_owner_str or 'не был занят'})")
+
+                    start_time = time.time()
+                    success, msg = monitor.capture_domain(domain, target_type, group_id)
+                    elapsed = time.time() - start_time
+
+                    if tg_token and tg_chatid:
+                        send_telegram(tg_token, tg_chatid, domain, success,
+                                      old_owner_str, elapsed, target_desc)
+
+                    if success:
+                        print_success(f"✅ {domain} захвачен за {elapsed:.3f} сек!")
+                        # Можно продолжить мониторинг других доменов или завершить
+                        # Здесь для примера завершим после первого захвата
+                        print_info("🏁 Работа завершена. Для продолжения перезапустите скрипт.")
+                        sys.exit(0)
+                    else:
+                        print_error(f"❌ Не удалось захватить {domain} за {elapsed:.3f} сек: {msg}")
+                        capture_fails[domain] += 1
+                        if capture_fails[domain] >= MAX_CAPTURE_FAILS:
+                            print_error(f"Лимит ошибок для {domain}, удаляю из мониторинга.")
+                            valid_domains.remove(domain)
+                            if not valid_domains:
+                                print_error("❌ Нет больше доменов для мониторинга.")
+                                sys.exit(1)
+                else:
+                    last_owner[domain] = status
+
+            time.sleep(BASE_INTERVAL)
+
+    except KeyboardInterrupt:
+        print_warning("\n⚠️ Остановлено пользователем.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
